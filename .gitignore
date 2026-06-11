@@ -10,3 +10,6 @@ outputs/
 .venv/
 venv/
 .claude
+CLAUDE.md
+FINETUNE_PLAN.md
+launch.md
