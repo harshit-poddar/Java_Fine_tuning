@@ -1,0 +1,51 @@
+rules:
+  - id: java-cmdi-runtime-exec
+    languages: [java]
+    severity: ERROR
+    message: >
+      Runtime.exec() with a single command string (CWE-78). Use ProcessBuilder
+      with a fixed program and arguments passed as separate list elements,
+      never through a shell.
+    metadata:
+      cwe: CWE-78
+    patterns:
+      - pattern-either:
+          - pattern: $RT.exec(<... $A + $B ...>)
+          - pattern: Runtime.getRuntime().exec($CMD)
+          - pattern: $RT.exec($CMD)
+      - pattern-not: $RT.exec(new String[]{"...", "..."})
+      - pattern-not: $RT.exec(new String[]{"...", "...", "..."})
+
+  - id: java-cmdi-shell-passthrough
+    languages: [java]
+    severity: ERROR
+    message: >
+      A command string is passed through a shell interpreter (sh -c /
+      cmd.exe /c) (CWE-78). Invoke the target program directly with
+      ProcessBuilder and a fixed argument list.
+    metadata:
+      cwe: CWE-78
+    pattern-either:
+      - pattern: new ProcessBuilder("sh", "-c", $CMD, ...)
+      - pattern: new ProcessBuilder("/bin/sh", "-c", $CMD, ...)
+      - pattern: new ProcessBuilder("bash", "-c", $CMD, ...)
+      - pattern: new ProcessBuilder("/bin/bash", "-c", $CMD, ...)
+      - pattern: new ProcessBuilder("cmd", "/c", $CMD, ...)
+      - pattern: new ProcessBuilder("cmd.exe", "/c", $CMD, ...)
+      - pattern: $RT.exec(new String[]{"sh", "-c", $CMD})
+      - pattern: $RT.exec(new String[]{"/bin/sh", "-c", $CMD})
+      - pattern: $RT.exec(new String[]{"bash", "-c", $CMD})
+      - pattern: $RT.exec(new String[]{"cmd", "/c", $CMD})
+      - pattern: $RT.exec(new String[]{"cmd.exe", "/c", $CMD})
+
+  - id: java-cmdi-processbuilder-concat
+    languages: [java]
+    severity: ERROR
+    message: >
+      A ProcessBuilder argument is built with string concatenation (CWE-78).
+      Pass untrusted values as their own list element after validation.
+    metadata:
+      cwe: CWE-78
+    pattern-either:
+      - pattern: new ProcessBuilder(<... $A + $B ...>)
+      - pattern: $PB.command(<... $A + $B ...>)

@@ -1,0 +1,22 @@
+# Pinned to the versions the code was written and tested against.
+#
+# torch is intentionally NOT listed:
+#   - local (CPU dev):  pip install torch --index-url https://download.pytorch.org/whl/cpu
+#   - pod (MI300X):     use the ROCm torch build already in the pod image
+#
+# vLLM is also pod-only and comes with the pod image / its own install
+# (see serve/serve_notes.md).
+
+transformers==5.11.0
+trl==1.5.1
+peft==0.19.1
+datasets==5.0.0
+accelerate==1.13.0
+pydantic==2.12.5
+requests==2.34.2
+PyYAML==6.0
+pytest==9.0.2
+
+# Vuln scanning for the eval harness. No native Windows support - the harness
+# degrades gracefully there (vuln_fixed=None); install on the (Linux) pod.
+semgrep>=1.99 ; platform_system == "Linux"

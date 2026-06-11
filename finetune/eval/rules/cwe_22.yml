@@ -1,0 +1,59 @@
+rules:
+  - id: java-path-traversal-concat-into-fs-api
+    languages: [java]
+    severity: ERROR
+    message: >
+      A filesystem path is built with string concatenation (CWE-22). Resolve
+      against a fixed base directory and verify the canonical path stays
+      inside it (getCanonicalPath/normalize + startsWith) before use.
+    metadata:
+      cwe: CWE-22
+    pattern-either:
+      - pattern: new File(<... $A + $B ...>)
+      - pattern: new FileInputStream(<... $A + $B ...>)
+      - pattern: new FileOutputStream(<... $A + $B ...>)
+      - pattern: new FileReader(<... $A + $B ...>)
+      - pattern: new FileWriter(<... $A + $B ...>)
+      - pattern: new RandomAccessFile(<... $A + $B ...>, ...)
+      - pattern: Paths.get(<... $A + $B ...>)
+      - pattern: Path.of(<... $A + $B ...>)
+      - pattern: $FS.getPath(<... $A + $B ...>)
+
+  - id: java-path-traversal-unvalidated-resolve
+    languages: [java]
+    severity: WARNING
+    message: >
+      An untrusted file name is resolved or opened without a containment
+      check on the canonical/normalized path (CWE-22).
+    metadata:
+      cwe: CWE-22
+    patterns:
+      - pattern-either:
+          - pattern: new File($BASE, $NAME)
+          - pattern: $BASE.resolve($NAME)
+      - pattern-not: new File($BASE, "...")
+      - pattern-not: $BASE.resolve("...")
+      - pattern-not-inside: |
+          $RT $M(...) {
+            ...
+            ... $X.getCanonicalPath() ...;
+            ...
+          }
+      - pattern-not-inside: |
+          $RT $M(...) {
+            ...
+            ... $X.getCanonicalFile() ...;
+            ...
+          }
+      - pattern-not-inside: |
+          $RT $M(...) {
+            ...
+            ... $X.normalize() ...;
+            ...
+          }
+      - pattern-not-inside: |
+          $RT $M(...) {
+            ...
+            ... $X.toRealPath(...) ...;
+            ...
+          }

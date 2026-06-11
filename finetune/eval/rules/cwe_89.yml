@@ -1,0 +1,36 @@
+rules:
+  - id: java-sqli-concat-into-sql-api
+    languages: [java]
+    severity: ERROR
+    message: >
+      SQL is built with string concatenation and passed to a JDBC execution
+      API (CWE-89). Use PreparedStatement with bind parameters.
+    metadata:
+      cwe: CWE-89
+    pattern-either:
+      - pattern: $S.executeQuery(<... $A + $B ...>)
+      - pattern: $S.executeUpdate(<... $A + $B ...>)
+      - pattern: $S.execute(<... $A + $B ...>)
+      - pattern: $S.addBatch(<... $A + $B ...>)
+      - pattern: $C.prepareStatement(<... $A + $B ...>)
+      - pattern: $C.prepareCall(<... $A + $B ...>)
+
+  - id: java-sqli-statement-exec-nonliteral
+    languages: [java]
+    severity: WARNING
+    message: >
+      A non-literal SQL string is passed to a Statement execution API
+      (CWE-89). If any part of it is user-controlled this is SQL injection;
+      use PreparedStatement with bind parameters.
+    metadata:
+      cwe: CWE-89
+    patterns:
+      - pattern-either:
+          - pattern: $S.executeQuery($SQL)
+          - pattern: $S.executeUpdate($SQL)
+          - pattern: $S.execute($SQL)
+          - pattern: $S.addBatch($SQL)
+      - pattern-not: $S.executeQuery("...")
+      - pattern-not: $S.executeUpdate("...")
+      - pattern-not: $S.execute("...")
+      - pattern-not: $S.addBatch("...")
