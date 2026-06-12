@@ -29,6 +29,7 @@ import os
 import random
 import re
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Callable, Iterable, Optional
 
@@ -67,6 +68,9 @@ class PrepConfig(BaseModel):
     near_dup_jaccard: float = Field(default_factory=lambda: float(os.getenv("PREP_NEAR_DUP_JACCARD", "0.85")))
     fractions: tuple[float, float, float] = (0.8, 0.1, 0.1)
     compile_filter: bool = True
+    #: parallel workers for the javac/semgrep verification (subprocess-bound,
+    #: so threads scale to physical cores; 112 on the pod)
+    workers: int = Field(default_factory=lambda: int(os.getenv("PREP_WORKERS", str(min(32, os.cpu_count() or 4)))))
     #: verify labels with the SAME semgrep rules the eval uses: vulnerable
     #: side must trigger the CWE rule, fixed side must not. Needs semgrep
     #: (pod/Linux) - skipped with a warning elsewhere.
@@ -285,6 +289,9 @@ def clean_pairs(pairs: list[RawPair], config: PrepConfig) -> tuple[list[RawPair]
                   "(run it on the pod before training)", file=sys.stderr)
             semgrep_filter = False
 
+    # Phase 1 (sequential, cheap): scope, empty, dedup, length. Dedup is
+    # order-dependent, so it must stay sequential for determinism.
+    candidates: list[RawPair] = []
     for pair in pairs:
         cwe = _normalize_cwe_label(pair.cwe)
         if cwe is None:
@@ -305,22 +312,38 @@ def clean_pairs(pairs: list[RawPair], config: PrepConfig) -> tuple[list[RawPair]
         if triplet_len > config.max_chars:
             drops["too_long"] += 1
             continue
+        seen.add(fingerprint)
+        candidates.append(pair.model_copy(update={"cwe": cwe}))
+
+    if not (compile_filter or semgrep_filter):
+        return candidates, drops
+
+    # Phase 2 (parallel): javac/semgrep verification. Subprocess-bound, so
+    # threads give real parallelism; results keep input order (ex.map).
+    def verify(pair: RawPair) -> Optional[str]:
+        """Returns the drop-reason key, or None to keep the pair."""
         if compile_filter:
             compiles, _ = check_compiles(pair.fixed_code, harness_cfg)
             if compiles is False:
-                drops["fixed_fails_javac"] += 1
-                continue
+                return "fixed_fails_javac"
         if semgrep_filter:
-            vuln_clean, _ = check_vuln_fixed(pair.vulnerable_code, cwe, harness_cfg)
+            vuln_clean, _ = check_vuln_fixed(pair.vulnerable_code, pair.cwe, harness_cfg)
             if vuln_clean is True:  # "vulnerable" side doesn't trigger the rule
-                drops["vuln_not_flagged"] += 1
-                continue
-            fixed_clean, _ = check_vuln_fixed(pair.fixed_code, cwe, harness_cfg)
+                return "vuln_not_flagged"
+            fixed_clean, _ = check_vuln_fixed(pair.fixed_code, pair.cwe, harness_cfg)
             if fixed_clean is False:  # "fixed" side still vulnerable (e.g. G2B)
-                drops["fixed_still_flagged"] += 1
-                continue
-        seen.add(fingerprint)
-        kept.append(pair.model_copy(update={"cwe": cwe}))
+                return "fixed_still_flagged"
+        return None
+
+    print(f"verifying {len(candidates)} pairs with {config.workers} parallel workers "
+          f"(javac={compile_filter}, semgrep={semgrep_filter}) ...", flush=True)
+    with ThreadPoolExecutor(max_workers=config.workers) as executor:
+        verdicts = list(executor.map(verify, candidates))
+    for pair, verdict in zip(candidates, verdicts):
+        if verdict is None:
+            kept.append(pair)
+        else:
+            drops[verdict] += 1
     return kept, drops
 
 
