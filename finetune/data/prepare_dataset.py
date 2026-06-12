@@ -36,7 +36,7 @@ from pydantic import BaseModel, Field
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from finetune.eval.harness import HarnessConfig, check_compiles  # noqa: E402
+from finetune.eval.harness import HarnessConfig, check_compiles, check_vuln_fixed  # noqa: E402
 
 TARGET_CWES = ("CWE-89", "CWE-22", "CWE-78")
 
@@ -51,7 +51,8 @@ SYSTEM_PROMPT = (
     "You are a senior application-security engineer. You fix vulnerabilities in "
     "Java code. Reply with ONLY the complete fixed Java code inside a single "
     "```java code block. Keep the original class and method signatures; change "
-    "only what is needed to remove the vulnerability."
+    "only what is needed to remove the vulnerability. If the given code is "
+    "already secure, return it unchanged."
 )
 
 # Juliet uses child CWEs for path traversal; fold them into our target id.
@@ -66,6 +67,15 @@ class PrepConfig(BaseModel):
     near_dup_jaccard: float = Field(default_factory=lambda: float(os.getenv("PREP_NEAR_DUP_JACCARD", "0.85")))
     fractions: tuple[float, float, float] = (0.8, 0.1, 0.1)
     compile_filter: bool = True
+    #: verify labels with the SAME semgrep rules the eval uses: vulnerable
+    #: side must trigger the CWE rule, fixed side must not. Needs semgrep
+    #: (pod/Linux) - skipped with a warning elsewhere.
+    semgrep_filter: bool = Field(default_factory=lambda: os.getenv("PREP_SEMGREP_FILTER", "0") == "1")
+    #: share of each split duplicated as already-secure "return it unchanged"
+    #: examples - teaches the model restraint (no fixing secure code)
+    negatives_frac: float = Field(default_factory=lambda: float(os.getenv("PREP_NEGATIVES_FRAC", "0.10")))
+    #: cap on general instruction data mixed into TRAIN (anti-forgetting replay)
+    replay_frac: float = Field(default_factory=lambda: float(os.getenv("PREP_REPLAY_FRAC", "0.15")))
 
 
 class RawPair(BaseModel):
@@ -73,14 +83,29 @@ class RawPair(BaseModel):
     fixed_code: str
     cwe: str
     source_id: str
+    kind: str = "fix"  # "fix" | "no_change"
 
 
 def build_user_prompt(vulnerable_code: str, cwe: str) -> str:
     """The `input` field of a triplet. Also used verbatim by the eval runner."""
     return (
-        f"The following Java code contains a {cwe} vulnerability "
-        f"({CWE_DESCRIPTIONS[cwe]}). Fix the vulnerability.\n\n"
+        f"Review the following Java code for a {cwe} vulnerability "
+        f"({CWE_DESCRIPTIONS[cwe]}). If the vulnerability is present, fix it. "
+        "If the code is already secure, return it unchanged.\n\n"
         f"```java\n{vulnerable_code.rstrip()}\n```"
+    )
+
+
+def make_negative(pair: RawPair) -> RawPair:
+    """An already-secure example: input is the FIXED code, expected output is
+    the same code unchanged. Derived in-split, so it can never leak the fix of
+    a test item into training."""
+    return pair.model_copy(
+        update={
+            "vulnerable_code": pair.fixed_code,
+            "kind": "no_change",
+            "source_id": pair.source_id + "#neg",
+        }
     )
 
 
@@ -157,10 +182,23 @@ def _wrap_method(method_src: str, imports: list[str], class_name: str) -> str:
     return f"{body}public class {class_name} {{\n\n{method_src}\n}}\n"
 
 
+#: Juliet "good" variants, in preference order. B2G ("bad source to good
+#: sink") fixes the SINK - the secure-coding lesson we want to teach. G2B
+#: ("good source to bad sink") merely swaps the input for a safe constant
+#: while the sink stays vulnerable - a wrong lesson, used only as a last
+#: resort and reliably killed later by the --semgrep-filter.
+_JULIET_GOOD_VARIANTS = (
+    (r"goodB2G\d*", "B2G"),
+    (r"good1", "good1"),
+    (r"goodG2B\d*", "G2B"),
+)
+_JULIET_GOOD_NAME_RE = re.compile(r"\bgood(?:B2G|G2B)?\d*\b")
+
+
 def parse_juliet_sources(raw_dir: Path) -> list[RawPair]:
     """Adapter: NIST Juliet Java testcases. Best-effort method-level extraction;
     pairs whose rewrapped code does not compile are dropped later by the
-    javac filter."""
+    javac filter. Prefers goodB2G fix variants (see _JULIET_GOOD_VARIANTS)."""
     pairs: list[RawPair] = []
     for java_path in sorted(raw_dir.rglob("*.java")):
         match = _JULIET_FILE_RE.search(java_path.name)
@@ -176,17 +214,22 @@ def parse_juliet_sources(raw_dir: Path) -> list[RawPair]:
             if re.match(r"^\s*import\s+javax?\.[\w.*]+\s*;\s*$", line)
         ]
         bad = _extract_method(source, "bad")
-        good = _extract_method(source, r"(?:goodG2B\d*|good1|good)")
+        good, variant = None, None
+        for pattern, label in _JULIET_GOOD_VARIANTS:
+            good = _extract_method(source, pattern)
+            if good:
+                variant = label
+                break
         if not bad or not good:
             continue
         stem = re.sub(r"\W", "_", java_path.stem)
         pairs.append(
             RawPair(
                 vulnerable_code=_wrap_method(bad, imports, f"{stem}_case"),
-                fixed_code=_wrap_method(good.replace("goodG2B", "bad").replace("good1", "bad"),
+                fixed_code=_wrap_method(_JULIET_GOOD_NAME_RE.sub("bad", good),
                                         imports, f"{stem}_case"),
                 cwe=cwe,
-                source_id=str(java_path.relative_to(raw_dir)),
+                source_id=f"{java_path.relative_to(raw_dir)}:{variant}",
             )
         )
     return pairs
@@ -222,7 +265,8 @@ def _jaccard(a: frozenset, b: frozenset) -> float:
 
 def clean_pairs(pairs: list[RawPair], config: PrepConfig) -> tuple[list[RawPair], dict[str, int]]:
     """Filter to target CWEs, dedup, length-cap, and javac-check fixed_code."""
-    drops = {"cwe_out_of_scope": 0, "empty": 0, "duplicate": 0, "too_long": 0, "fixed_fails_javac": 0}
+    drops = {"cwe_out_of_scope": 0, "empty": 0, "duplicate": 0, "too_long": 0,
+             "fixed_fails_javac": 0, "vuln_not_flagged": 0, "fixed_still_flagged": 0}
     seen: set[str] = set()
     kept: list[RawPair] = []
 
@@ -233,6 +277,13 @@ def clean_pairs(pairs: list[RawPair], config: PrepConfig) -> tuple[list[RawPair]
         if probe is None:  # javac missing -> degrade gracefully, keep pairs
             print("WARNING: javac not found - compile filter SKIPPED for this run", file=sys.stderr)
             compile_filter = False
+    semgrep_filter = config.semgrep_filter
+    if semgrep_filter:
+        probe, _ = check_vuln_fixed("public class _Probe {}", TARGET_CWES[0], harness_cfg)
+        if probe is None:  # semgrep missing -> degrade gracefully
+            print("WARNING: semgrep not found - semgrep filter SKIPPED for this run "
+                  "(run it on the pod before training)", file=sys.stderr)
+            semgrep_filter = False
 
     for pair in pairs:
         cwe = _normalize_cwe_label(pair.cwe)
@@ -258,6 +309,15 @@ def clean_pairs(pairs: list[RawPair], config: PrepConfig) -> tuple[list[RawPair]
             compiles, _ = check_compiles(pair.fixed_code, harness_cfg)
             if compiles is False:
                 drops["fixed_fails_javac"] += 1
+                continue
+        if semgrep_filter:
+            vuln_clean, _ = check_vuln_fixed(pair.vulnerable_code, cwe, harness_cfg)
+            if vuln_clean is True:  # "vulnerable" side doesn't trigger the rule
+                drops["vuln_not_flagged"] += 1
+                continue
+            fixed_clean, _ = check_vuln_fixed(pair.fixed_code, cwe, harness_cfg)
+            if fixed_clean is False:  # "fixed" side still vulnerable (e.g. G2B)
+                drops["fixed_still_flagged"] += 1
                 continue
         seen.add(fingerprint)
         kept.append(pair.model_copy(update={"cwe": cwe}))
@@ -336,29 +396,65 @@ def to_record(pair: RawPair) -> dict:
         "cwe": pair.cwe,
         "vulnerable_code": pair.vulnerable_code,
         "source_id": pair.source_id,
+        "kind": pair.kind,
     }
 
 
-def write_splits(splits: dict[str, list[RawPair]], out_dir: Path) -> dict:
+def load_replay_records(path: Path) -> list[dict]:
+    """General instruction data ({system, input, output} JSONL) for replay mixing."""
+    records = []
+    with path.open(encoding="utf-8") as fh:
+        for i, line in enumerate(fh):
+            if not line.strip():
+                continue
+            raw = json.loads(line)
+            missing = [k for k in ("system", "input", "output") if not raw.get(k)]
+            if missing:
+                raise SystemExit(f"{path}:{i + 1}: replay record missing keys {missing}")
+            records.append(
+                {
+                    "system": raw["system"],
+                    "input": raw["input"],
+                    "output": raw["output"],
+                    "cwe": "general",
+                    "vulnerable_code": "",
+                    "source_id": f"{path.name}:{i}",
+                    "kind": "replay",
+                }
+            )
+    if not records:
+        raise SystemExit(f"Replay file {path} is empty.")
+    return records
+
+
+def write_splits(records_by_split: dict[str, list[dict]], out_dir: Path) -> dict:
     out_dir.mkdir(parents=True, exist_ok=True)
     stats: dict = {"splits": {}}
-    for name, pairs in splits.items():
+    for name, records in records_by_split.items():
         path = out_dir / f"{name}.jsonl"
         with path.open("w", encoding="utf-8") as fh:
-            for pair in pairs:
-                fh.write(json.dumps(to_record(pair), ensure_ascii=False) + "\n")
-        per_cwe = {cwe: sum(1 for p in pairs if p.cwe == cwe) for cwe in TARGET_CWES}
-        stats["splits"][name] = {"total": len(pairs), **per_cwe}
+            for record in records:
+                fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+        row: dict = {"total": len(records)}
+        for cwe in sorted({r["cwe"] for r in records}):
+            row[cwe] = sum(1 for r in records if r["cwe"] == cwe)
+        for kind in ("no_change", "replay"):
+            row[kind] = sum(1 for r in records if r["kind"] == kind)
+        stats["splits"][name] = row
     (out_dir / "stats.json").write_text(json.dumps(stats, indent=2), encoding="utf-8")
     return stats
 
 
 def print_stats(stats: dict, drops: dict[str, int]) -> None:
     print("\n== dataset stats ==")
-    header = f"{'split':<8}" + "".join(f"{cwe:>10}" for cwe in TARGET_CWES) + f"{'total':>10}"
-    print(header)
+    cwes = sorted(
+        {key for row in stats["splits"].values() for key in row}
+        - {"total", "no_change", "replay"}
+    )
+    columns = [*cwes, "no_change", "replay", "total"]
+    print(f"{'split':<8}" + "".join(f"{c:>11}" for c in columns))
     for name, row in stats["splits"].items():
-        print(f"{name:<8}" + "".join(f"{row[cwe]:>10}" for cwe in TARGET_CWES) + f"{row['total']:>10}")
+        print(f"{name:<8}" + "".join(f"{row.get(c, 0):>11}" for c in columns))
     print("\ndropped during cleaning: " + json.dumps(drops))
 
 
@@ -500,8 +596,15 @@ def make_demo_data(raw_dir: Path) -> Path:
 # CLI
 # ---------------------------------------------------------------------------
 
-def prepare(raw_dir: Path, out_dir: Path, config: PrepConfig, parser_name: str = "auto") -> dict:
-    """Full pipeline: parse -> clean -> split -> write. Returns the stats dict."""
+def prepare(raw_dir: Path, out_dir: Path, config: PrepConfig, parser_name: str = "auto",
+            replay_file: Optional[Path] = None) -> dict:
+    """Full pipeline: parse -> clean -> split -> negatives -> replay -> write.
+
+    Negatives are sampled per split AFTER splitting, so a negative always
+    lives in the same split as the pair it came from (no leakage). Replay
+    data is mixed into TRAIN only - val/test must stay pure task data so the
+    metric is untouched.
+    """
     if parser_name == "auto":
         pairs = [pair for parse in PARSERS.values() for pair in parse(raw_dir)]
     else:
@@ -516,8 +619,38 @@ def prepare(raw_dir: Path, out_dir: Path, config: PrepConfig, parser_name: str =
     if not kept:
         raise SystemExit(f"All {len(pairs)} pairs were dropped during cleaning: {drops}")
     splits = split_pairs(kept, config)
-    stats = write_splits(splits, out_dir)
+
+    rng = random.Random(config.seed + 1)
+    negatives_added = 0
+    if config.negatives_frac > 0:
+        for name, split_members in splits.items():
+            if not split_members:
+                continue
+            count = min(len(split_members),
+                        max(1, round(len(split_members) * config.negatives_frac)))
+            split_members.extend(make_negative(p) for p in rng.sample(split_members, count))
+            rng.shuffle(split_members)
+            negatives_added += count
+
+    records_by_split = {name: [to_record(p) for p in members] for name, members in splits.items()}
+
+    replay_added = 0
+    if replay_file is not None:
+        replay = load_replay_records(replay_file)
+        rng.shuffle(replay)
+        cap = int(len(records_by_split["train"]) * config.replay_frac)
+        chosen = replay[:cap]
+        if len(replay) > cap:
+            print(f"replay file has {len(replay)} records; mixing in {cap} "
+                  f"(replay_frac={config.replay_frac})")
+        records_by_split["train"].extend(chosen)
+        rng.shuffle(records_by_split["train"])
+        replay_added = len(chosen)
+
+    stats = write_splits(records_by_split, out_dir)
     stats["drops"] = drops
+    stats["negatives_added"] = negatives_added
+    stats["replay_added"] = replay_added
     print_stats(stats, drops)
     print(f"\nwrote splits to {out_dir}")
     return stats
@@ -533,6 +666,14 @@ def main() -> None:
     parser.add_argument("--max-chars", type=int, default=None, help="override PREP_MAX_CHARS")
     parser.add_argument("--no-compile-filter", action="store_true",
                         help="skip the javac check on fixed_code")
+    parser.add_argument("--semgrep-filter", action="store_true",
+                        help="drop pairs whose labels disagree with the eval's semgrep "
+                             "rules (needs semgrep; run on the pod before training)")
+    parser.add_argument("--negatives-frac", type=float, default=None,
+                        help="override PREP_NEGATIVES_FRAC (0 disables negatives)")
+    parser.add_argument("--replay-file", type=Path, default=None,
+                        help="JSONL of general {system,input,output} records to mix "
+                             "into TRAIN (anti-forgetting replay, capped by PREP_REPLAY_FRAC)")
     parser.add_argument("--make-demo-data", action="store_true",
                         help="write a tiny synthetic CSV into --raw-dir and exit")
     args = parser.parse_args()
@@ -548,7 +689,11 @@ def main() -> None:
         config = config.model_copy(update={"max_chars": args.max_chars})
     if args.no_compile_filter:
         config = config.model_copy(update={"compile_filter": False})
-    prepare(args.raw_dir, args.out_dir, config, args.parser)
+    if args.semgrep_filter:
+        config = config.model_copy(update={"semgrep_filter": True})
+    if args.negatives_frac is not None:
+        config = config.model_copy(update={"negatives_frac": args.negatives_frac})
+    prepare(args.raw_dir, args.out_dir, config, args.parser, args.replay_file)
 
 
 if __name__ == "__main__":

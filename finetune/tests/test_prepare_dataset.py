@@ -88,6 +88,48 @@ def test_juliet_adapter_extracts_bad_good_pair(tmp_path: Path) -> None:
     assert "AbstractTestCase" not in pair.vulnerable_code
 
 
+JULIET_BOTH_VARIANTS = """\
+package testcases.CWE89_SQL_Injection.s01;
+import testcasesupport.*;
+
+public class CWE89_SQL_Injection__database_02 extends AbstractTestCase {
+    public void bad() throws Throwable {
+        String data = getUserInput();
+        runSink(data);
+    }
+
+    public void goodG2B() throws Throwable {
+        String data = "safe-constant";
+        runSink(data);
+    }
+
+    public void goodB2G() throws Throwable {
+        String data = getUserInput();
+        runSafeSink(data);
+    }
+}
+"""
+
+
+def test_juliet_adapter_prefers_b2g_fix_variant(tmp_path: Path) -> None:
+    (tmp_path / "CWE89_SQL_Injection__database_02.java").write_text(
+        JULIET_BOTH_VARIANTS, encoding="utf-8"
+    )
+    pairs = parse_juliet_sources(tmp_path)
+    assert len(pairs) == 1
+    pair = pairs[0]
+    assert pair.source_id.endswith(":B2G")
+    assert "runSafeSink" in pair.fixed_code        # the B2G body was chosen
+    assert "safe-constant" not in pair.fixed_code  # not the G2B constant swap
+    assert "goodB2G" not in pair.fixed_code        # renamed to bad
+
+
+def test_juliet_adapter_falls_back_to_g2b(tmp_path: Path) -> None:
+    (tmp_path / "CWE89_SQL_Injection__database_01.java").write_text(JULIET_FILE, encoding="utf-8")
+    pairs = parse_juliet_sources(tmp_path)
+    assert pairs[0].source_id.endswith(":G2B")
+
+
 def test_juliet_adapter_maps_cwe23_to_cwe22(tmp_path: Path) -> None:
     content = JULIET_FILE.replace("CWE89_SQL_Injection", "CWE23_Relative_Path_Traversal")
     (tmp_path / "CWE23_Relative_Path_Traversal__file_01.java").write_text(content, encoding="utf-8")
@@ -129,6 +171,35 @@ def test_clean_drops_too_long() -> None:
                               _no_compile_cfg())
     assert kept == []
     assert drops["too_long"] == 1
+
+
+def test_semgrep_filter_skips_gracefully_without_semgrep(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
+) -> None:
+    import shutil as _shutil
+
+    monkeypatch.setattr(_shutil, "which", lambda _: None)
+    kept, drops = clean_pairs([_pair()], PrepConfig(compile_filter=False, semgrep_filter=True))
+    assert len(kept) == 1  # nothing dropped, filter skipped
+    assert "semgrep filter SKIPPED" in capsys.readouterr().err
+
+
+def test_semgrep_filter_drops_mislabeled_pairs(monkeypatch: pytest.MonkeyPatch) -> None:
+    # fake semgrep verdicts: "SAFE" marker means no finding
+    def fake_check(code: str, cwe: str, cfg) -> tuple[bool, str]:
+        return ("SAFE" in code, "fake")
+
+    monkeypatch.setattr(prep, "check_vuln_fixed", fake_check)
+    good = _pair(vuln="class A { int VULN; }", fixed="class A { int SAFE; }")
+    g2b_like = _pair(vuln="class B { int VULN; }", fixed="class B { int VULN2; }",
+                     source_id="t:1")  # "fixed" still triggers the rule
+    not_vuln = _pair(vuln="class C { int SAFE; }", fixed="class C { int SAFE2; }",
+                     source_id="t:2")  # "vulnerable" side never triggers
+    kept, drops = clean_pairs([good, g2b_like, not_vuln],
+                              PrepConfig(compile_filter=False, semgrep_filter=True))
+    assert [p.source_id for p in kept] == ["t:0"]
+    assert drops["fixed_still_flagged"] == 1
+    assert drops["vuln_not_flagged"] == 1
 
 
 @pytest.mark.skipif(not HAVE_JAVAC, reason="javac not installed")
@@ -190,10 +261,74 @@ def test_end_to_end_with_demo_data(tmp_path: Path) -> None:
         assert path.exists()
         for line in path.read_text(encoding="utf-8").splitlines():
             record = json.loads(line)
-            assert set(record) == {"system", "input", "output", "cwe", "vulnerable_code", "source_id"}
+            assert set(record) == {"system", "input", "output", "cwe",
+                                   "vulnerable_code", "source_id", "kind"}
             assert record["cwe"] in prep.TARGET_CWES
             assert record["output"].startswith("```java\n")
+            assert record["kind"] in ("fix", "no_change")
     assert stats["drops"]["duplicate"] == 1  # the deliberate duplicate was caught
     assert (out / "stats.json").exists()
     total = sum(row["total"] for row in stats["splits"].values())
-    assert total == 18
+    assert total == 18 + stats["negatives_added"]
+    assert stats["negatives_added"] >= 3  # at least one per non-empty split
+
+
+# --------------------------------------------------------- negatives & replay
+
+def test_make_negative_uses_fixed_code_both_sides() -> None:
+    pair = _pair(vuln="class V { int bad; }", fixed="class V { int good; }")
+    negative = prep.make_negative(pair)
+    assert negative.vulnerable_code == pair.fixed_code
+    assert negative.fixed_code == pair.fixed_code
+    assert negative.kind == "no_change"
+    assert negative.source_id.endswith("#neg")
+
+
+def test_negative_record_expects_unchanged_output() -> None:
+    pair = _pair(fixed="class F { int y; }")
+    record = prep.to_record(prep.make_negative(pair))
+    assert "class F { int y; }" in record["input"]
+    assert record["output"] == "```java\nclass F { int y; }\n```"
+
+
+def test_negatives_stay_in_source_split(tmp_path: Path) -> None:
+    raw, out = tmp_path / "raw", tmp_path / "out"
+    make_demo_data(raw)
+    prepare(raw, out, PrepConfig(compile_filter=False))
+    for name in ("train", "val", "test"):
+        records = [json.loads(l) for l in (out / f"{name}.jsonl").read_text(encoding="utf-8").splitlines()]
+        in_split = {r["source_id"] for r in records}
+        for record in records:
+            if record["kind"] == "no_change":
+                assert record["source_id"][: -len("#neg")] in in_split
+
+
+def test_replay_mixes_into_train_only_and_is_capped(tmp_path: Path) -> None:
+    raw, out = tmp_path / "raw", tmp_path / "out"
+    make_demo_data(raw)
+    replay_path = tmp_path / "general.jsonl"
+    replay_records = [
+        {"system": "You are helpful.", "input": f"Question {i}?", "output": f"Answer {i}."}
+        for i in range(100)
+    ]
+    replay_path.write_text(
+        "\n".join(json.dumps(r) for r in replay_records) + "\n", encoding="utf-8"
+    )
+    config = PrepConfig(compile_filter=False, replay_frac=0.2)
+    stats = prepare(raw, out, config, replay_file=replay_path)
+
+    assert 0 < stats["replay_added"] <= 100
+    train = [json.loads(l) for l in (out / "train.jsonl").read_text(encoding="utf-8").splitlines()]
+    task_train = [r for r in train if r["kind"] != "replay"]
+    replay_train = [r for r in train if r["kind"] == "replay"]
+    assert len(replay_train) == int(len(task_train) * 0.2)  # capped by replay_frac
+    for name in ("val", "test"):
+        records = [json.loads(l) for l in (out / f"{name}.jsonl").read_text(encoding="utf-8").splitlines()]
+        assert all(r["kind"] != "replay" for r in records)
+
+
+def test_replay_file_rejects_bad_records(tmp_path: Path) -> None:
+    bad = tmp_path / "bad.jsonl"
+    bad.write_text(json.dumps({"system": "s", "input": "i"}) + "\n", encoding="utf-8")
+    with pytest.raises(SystemExit, match="output"):
+        prep.load_replay_records(bad)

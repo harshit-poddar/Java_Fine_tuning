@@ -21,7 +21,11 @@ from __future__ import annotations
 import argparse
 import json
 import platform
+import shutil
+import subprocess
 import sys
+import threading
+import time
 from pathlib import Path
 from typing import Any, Optional
 
@@ -35,6 +39,72 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from finetune.train.config import TrainConfig  # noqa: E402
 
 REQUIRED_KEYS = ("system", "input", "output")
+
+
+class GpuMonitor:
+    """Samples rocm-smi (VRAM used, GPU busy %) in a background thread.
+
+    No-op when rocm-smi is absent (local CPU machines). The summary lands in
+    run_metadata.json as hardware-utilization evidence for the final report.
+    """
+
+    def __init__(self, interval_s: float = 30.0) -> None:
+        self.interval_s = interval_s
+        self.samples: list[dict] = []
+        self.bin = shutil.which("rocm-smi")
+        self._stop = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+
+    def _sample(self) -> None:
+        try:
+            proc = subprocess.run(
+                [self.bin, "--showuse", "--showmeminfo", "vram", "--json"],
+                capture_output=True, text=True, timeout=15,
+            )
+            data = json.loads(proc.stdout)
+        except Exception:
+            return
+        for card in data.values():
+            if not isinstance(card, dict):
+                continue
+            try:
+                used = int(card.get("VRAM Total Used Memory (B)", 0))
+                busy = float(card.get("GPU use (%)", 0))
+            except (TypeError, ValueError):
+                continue
+            self.samples.append(
+                {"t": round(time.time(), 1), "vram_used_gb": round(used / 2**30, 1),
+                 "gpu_busy_pct": busy}
+            )
+
+    def _loop(self) -> None:
+        while not self._stop.wait(self.interval_s):
+            self._sample()
+
+    def __enter__(self) -> "GpuMonitor":
+        if self.bin:
+            self._sample()
+            self._thread = threading.Thread(target=self._loop, daemon=True)
+            self._thread.start()
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        if self._thread:
+            self._stop.set()
+            self._thread.join(timeout=5)
+            self._sample()
+
+    def summary(self) -> Optional[dict]:
+        if not self.samples:
+            return None
+        vram = [s["vram_used_gb"] for s in self.samples]
+        busy = [s["gpu_busy_pct"] for s in self.samples]
+        return {
+            "samples": len(self.samples),
+            "vram_used_gb_max": max(vram),
+            "vram_used_gb_mean": round(sum(vram) / len(vram), 1),
+            "gpu_busy_pct_mean": round(sum(busy) / len(busy), 1),
+        }
 
 
 def load_records(path: Path, limit: Optional[int] = None) -> list[dict]:
@@ -117,14 +187,16 @@ def build_sft_config(config: TrainConfig, smoke: bool, have_val: bool,
         packing=False,
         eval_strategy="epoch" if have_val and not smoke else "no",
         logging_steps=config.logging_steps,
-        save_strategy="no",  # adapter is saved once, explicitly, at the end
+        # LoRA checkpoints are megabytes; smoke runs never checkpoint
+        save_strategy="no" if smoke else config.save_strategy,
+        save_total_limit=config.save_total_limit,
         seed=config.seed,
         report_to="none",
         model_init_kwargs={"dtype": "bfloat16" if config.bf16 else "float32"},
     )
 
 
-def run(config: TrainConfig, smoke: bool, dry_run: bool) -> dict:
+def run(config: TrainConfig, smoke: bool, dry_run: bool, resume: bool = False) -> dict:
     """Build everything, train unless --dry-run, return the run metadata."""
     limit = config.smoke_examples if smoke else None
     train_records = load_records(config.train_file, limit)
@@ -179,8 +251,14 @@ def run(config: TrainConfig, smoke: bool, dry_run: bool) -> dict:
     )
     trainer.model.print_trainable_parameters()
 
-    result = trainer.train()
+    if resume and sft_config.save_strategy == "no":
+        raise SystemExit("--resume needs checkpoints: set FT_SAVE_STRATEGY=epoch")
+    with GpuMonitor() as gpu:
+        result = trainer.train(resume_from_checkpoint=True if resume else None)
     print(f"train_loss={result.training_loss:.4f}")
+    if gpu.summary():
+        report["gpu_utilization"] = gpu.summary()
+        print(f"gpu utilization: {json.dumps(gpu.summary())}")
 
     output_dir = Path(config.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -205,8 +283,11 @@ def main() -> None:
                         help="50 examples / ~100 steps to validate the pod env")
     parser.add_argument("--dry-run", action="store_true",
                         help="validate config + data on CPU; never loads the model")
+    parser.add_argument("--resume", action="store_true",
+                        help="resume the full train from the latest checkpoint "
+                             "(requires FT_SAVE_STRATEGY=epoch)")
     args = parser.parse_args()
-    run(TrainConfig.from_env(), smoke=args.smoke, dry_run=args.dry_run)
+    run(TrainConfig.from_env(), smoke=args.smoke, dry_run=args.dry_run, resume=args.resume)
 
 
 if __name__ == "__main__":

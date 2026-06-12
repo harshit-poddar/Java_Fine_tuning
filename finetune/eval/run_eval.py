@@ -73,10 +73,12 @@ class MockClient:
 class OpenAICompatClient:
     """Talks to any OpenAI-compatible /chat/completions endpoint (e.g. vLLM)."""
 
-    def __init__(self, base_url: str, model: str, timeout_s: int = 180) -> None:
+    def __init__(self, base_url: str, model: str, timeout_s: int = 180,
+                 temperature: float = GEN_TEMPERATURE) -> None:
         self.base_url = base_url.rstrip("/")
         self.model = model
         self.timeout_s = timeout_s
+        self.temperature = temperature
         self.name = f"openai:{model}"
 
     def generate(self, system: str, user: str, record: dict) -> str:
@@ -90,7 +92,7 @@ class OpenAICompatClient:
                     {"role": "system", "content": system},
                     {"role": "user", "content": user},
                 ],
-                "temperature": GEN_TEMPERATURE,
+                "temperature": self.temperature,
                 "max_tokens": GEN_MAX_TOKENS,
             },
             timeout=self.timeout_s,

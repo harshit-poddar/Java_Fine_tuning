@@ -15,6 +15,7 @@ import pytest
 
 from finetune.train.config import TrainConfig
 from finetune.train.sft_lora import (
+    GpuMonitor,
     build_lora_config,
     build_sft_config,
     load_records,
@@ -99,6 +100,42 @@ def test_build_sft_config_full_vs_smoke() -> None:
     smoke = build_sft_config(config, smoke=True, have_val=True, cpu_fallback=True)
     assert smoke.max_steps == config.smoke_max_steps
     assert smoke.eval_strategy.value == "no"
+
+
+def test_build_sft_config_checkpointing_env_controlled() -> None:
+    config = TrainConfig(save_strategy="epoch", save_total_limit=3)
+    full = build_sft_config(config, smoke=False, have_val=True, cpu_fallback=True)
+    assert full.save_strategy.value == "epoch"
+    assert full.save_total_limit == 3
+    # smoke runs never checkpoint, regardless of config
+    smoke = build_sft_config(config, smoke=True, have_val=True, cpu_fallback=True)
+    assert smoke.save_strategy.value == "no"
+
+
+# ------------------------------------------------------------------ gpu monitor
+
+def test_gpu_monitor_noop_without_rocm_smi(monkeypatch: pytest.MonkeyPatch) -> None:
+    import shutil as _shutil
+
+    monkeypatch.setattr(_shutil, "which", lambda _: None)
+    with GpuMonitor(interval_s=0.01) as gpu:
+        pass
+    assert gpu.summary() is None
+
+
+def test_gpu_monitor_summary_from_samples() -> None:
+    gpu = GpuMonitor()
+    gpu.samples = [
+        {"t": 0, "vram_used_gb": 100.0, "gpu_busy_pct": 90.0},
+        {"t": 30, "vram_used_gb": 140.0, "gpu_busy_pct": 70.0},
+    ]
+    summary = gpu.summary()
+    assert summary == {
+        "samples": 2,
+        "vram_used_gb_max": 140.0,
+        "vram_used_gb_mean": 120.0,
+        "gpu_busy_pct_mean": 80.0,
+    }
 
 
 # ------------------------------------------------------------ dry-run pipeline

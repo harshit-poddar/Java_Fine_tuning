@@ -47,6 +47,11 @@ class TrainConfig(BaseModel):
     seed: int = 42
     logging_steps: int = 5
 
+    # checkpointing (LoRA checkpoints are small; enable once pod disk allows:
+    # FT_SAVE_STRATEGY=epoch). "no" = adapter saved once at the end only.
+    save_strategy: str = "no"
+    save_total_limit: int = 2
+
     # io
     train_file: Path = _DEFAULT_DATA_DIR / "train.jsonl"
     val_file: Path = _DEFAULT_DATA_DIR / "val.jsonl"

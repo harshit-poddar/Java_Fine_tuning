@@ -9,7 +9,9 @@ outputs/
 *.safetensors
 .venv/
 venv/
-.claude
+.claude/
 CLAUDE.md
 FINETUNE_PLAN.md
 launch.md
+dummy.txt
+image.png
