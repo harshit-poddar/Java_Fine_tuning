@@ -14,7 +14,7 @@ datasets==5.0.0
 accelerate==1.13.0
 pydantic==2.12.5
 requests==2.34.2
-PyYAML==6.0
+PyYAML==6.0.2
 pytest==9.0.2
 
 # Vuln scanning for the eval harness. No native Windows support - the harness

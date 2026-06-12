@@ -33,27 +33,55 @@ rules:
           - pattern: $BASE.resolve($NAME)
       - pattern-not: new File($BASE, "...")
       - pattern-not: $BASE.resolve("...")
+      # Suppress when the enclosing method canonicalizes/normalizes the path.
+      # The deep-expression operator <... E ...> only parses in an expression
+      # position, so each guard places the check inside an `if` condition or a
+      # variable initializer - the two forms fixed code actually uses.
       - pattern-not-inside: |
           $RT $M(...) {
             ...
-            ... $X.getCanonicalPath() ...;
+            if (<... $X.getCanonicalPath() ...>) { ... }
             ...
           }
       - pattern-not-inside: |
           $RT $M(...) {
             ...
-            ... $X.getCanonicalFile() ...;
+            $T $V = <... $X.getCanonicalPath() ...>;
             ...
           }
       - pattern-not-inside: |
           $RT $M(...) {
             ...
-            ... $X.normalize() ...;
+            if (<... $X.getCanonicalFile() ...>) { ... }
             ...
           }
       - pattern-not-inside: |
           $RT $M(...) {
             ...
-            ... $X.toRealPath(...) ...;
+            $T $V = <... $X.getCanonicalFile() ...>;
+            ...
+          }
+      - pattern-not-inside: |
+          $RT $M(...) {
+            ...
+            if (<... $X.normalize() ...>) { ... }
+            ...
+          }
+      - pattern-not-inside: |
+          $RT $M(...) {
+            ...
+            $T $V = <... $X.normalize() ...>;
+            ...
+          }
+      - pattern-not-inside: |
+          $RT $M(...) {
+            ...
+            if (<... $X.toRealPath(...) ...>) { ... }
+            ...
+          }
+      - pattern-not-inside: |
+          $RT $M(...) {
+            ...
+            $T $V = <... $X.toRealPath(...) ...>;
             ...
           }
