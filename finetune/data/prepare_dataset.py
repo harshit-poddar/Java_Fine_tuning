@@ -172,12 +172,34 @@ def _extract_method(source: str, name_regex: str) -> Optional[str]:
     return None
 
 
+#: Self-contained, compile-safe stand-ins for Juliet's testcasesupport.IO
+#: helper library. Order matters: longer member names first so prefixes
+#: (staticReturnsTrueOrFalse vs staticReturnsTrue) don't mis-replace.
+_JULIET_IO_REPLACEMENTS: tuple[tuple[str, str], ...] = (
+    ("IO.writeLine(", "System.out.println("),
+    ("IO.writeString(", "System.out.print("),
+    ("IO.getDBConnection()",
+     'java.sql.DriverManager.getConnection("jdbc:default:connection")'),
+    ("IO.logger", "java.util.logging.Logger.getGlobal()"),
+    ("IO.staticReturnsTrueOrFalse()", "(System.currentTimeMillis() % 2 == 0)"),
+    ("IO.staticReturnsTrue()", 'Boolean.parseBoolean("true")'),
+    ("IO.staticReturnsFalse()", 'Boolean.parseBoolean("false")'),
+    ("IO.STATIC_FINAL_TRUE", "true"),
+    ("IO.STATIC_FINAL_FALSE", "false"),
+    ("IO.staticTrue", 'Boolean.parseBoolean("true")'),
+    ("IO.staticFalse", 'Boolean.parseBoolean("false")'),
+    ("IO.STATIC_FINAL_FIVE", "5"),
+    ("IO.staticFive", 'Integer.parseInt("5")'),
+)
+
+
 def _juliet_strip(source: str) -> str:
     """Remove Juliet boilerplate so extracted methods can stand alone."""
     source = re.sub(r"^\s*package\s+[\w.]+\s*;\s*$", "", source, flags=re.MULTILINE)
     source = re.sub(r"^\s*import\s+testcasesupport\.[\w.*]+\s*;\s*$", "", source, flags=re.MULTILINE)
     source = re.sub(r"\bextends\s+AbstractTestCase(Base)?\b", "", source)
-    source = source.replace("IO.writeLine(", "System.out.println(")
+    for needle, replacement in _JULIET_IO_REPLACEMENTS:
+        source = source.replace(needle, replacement)
     return source
 
 
@@ -212,10 +234,14 @@ def parse_juliet_sources(raw_dir: Path) -> list[RawPair]:
         if cwe not in TARGET_CWES:
             continue
         source = _juliet_strip(java_path.read_text(encoding="utf-8", errors="replace"))
+        if re.search(r"\bIO\.", source):
+            continue  # uses an IO helper we have no stand-in for
+        # java.* only: javax.servlet etc. are not in the JDK, and importing a
+        # missing package is a hard compile error even when unused
         imports = [
             line.strip()
             for line in source.splitlines()
-            if re.match(r"^\s*import\s+javax?\.[\w.*]+\s*;\s*$", line)
+            if re.match(r"^\s*import\s+java\.[\w.*]+\s*;\s*$", line)
         ]
         bad = _extract_method(source, "bad")
         good, variant = None, None
