@@ -177,8 +177,9 @@ def build_sft_config(config: TrainConfig, smoke: bool, have_val: bool,
         gradient_accumulation_steps=config.grad_accum,
         learning_rate=config.learning_rate,
         lr_scheduler_type=config.lr_scheduler_type,
-        # float < 1 means "ratio of total steps" (warmup_ratio is deprecated)
-        warmup_steps=config.warmup_ratio,
+        # fraction of total training steps spent warming up; transformers wants
+        # warmup_steps as an int, so a fractional warmup goes through warmup_ratio
+        warmup_ratio=config.warmup_ratio,
         bf16=config.bf16,
         use_cpu=cpu_fallback,
         gradient_checkpointing=config.gradient_checkpointing,
