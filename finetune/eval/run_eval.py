@@ -128,17 +128,25 @@ class TransformersClient:
             {"role": "system", "content": system},
             {"role": "user", "content": user},
         ]
-        inputs = self.tokenizer.apply_chat_template(
-            messages, add_generation_prompt=True, return_tensors="pt"
-        ).to(self.model.device)
+        # return_dict=True works across transformers 4.x/5.x (5.x returns a
+        # BatchEncoding from apply_chat_template, not a bare tensor) and also
+        # gives us the attention_mask, which generate() wants.
+        encoded = self.tokenizer.apply_chat_template(
+            messages,
+            add_generation_prompt=True,
+            return_tensors="pt",
+            return_dict=True,
+        )
+        encoded = {k: v.to(self.model.device) for k, v in encoded.items()}
+        input_len = encoded["input_ids"].shape[1]
         with torch.no_grad():
             output = self.model.generate(
-                inputs,
+                **encoded,
                 max_new_tokens=GEN_MAX_TOKENS,
                 do_sample=False,
                 pad_token_id=self.tokenizer.pad_token_id or self.tokenizer.eos_token_id,
             )
-        return self.tokenizer.decode(output[0][inputs.shape[1]:], skip_special_tokens=True)
+        return self.tokenizer.decode(output[0][input_len:], skip_special_tokens=True)
 
 
 def make_client(spec: str) -> ModelClient:
@@ -190,7 +198,13 @@ def evaluate_model(client: ModelClient, records: list[dict]) -> list[dict]:
         try:
             response = client.generate(record["system"], record["input"], record)
         except Exception as error:  # endpoint hiccups shouldn't kill a long run
-            print(f"WARNING: [{client.name}] item {i} generation failed: {error}", file=sys.stderr)
+            # repr() keeps message-less exceptions visible; dump the full
+            # traceback once so a systemic failure is diagnosable, not silent.
+            print(f"WARNING: [{client.name}] item {i} generation failed: {error!r}",
+                  file=sys.stderr)
+            if i == 1:
+                import traceback
+                traceback.print_exc()
             response = ""
         scores = harness.score_patch(response, record["cwe"])
         results.append(
