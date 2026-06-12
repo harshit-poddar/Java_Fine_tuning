@@ -17,6 +17,7 @@ from finetune.data.prepare_dataset import (
     make_demo_data,
     parse_csv_sources,
     parse_juliet_sources,
+    synthesize_fixed_code,
     prepare,
     split_pairs,
 )
@@ -130,12 +131,103 @@ def test_juliet_adapter_falls_back_to_g2b(tmp_path: Path) -> None:
     assert pairs[0].source_id.endswith(":G2B")
 
 
-def test_juliet_adapter_maps_cwe23_to_cwe22(tmp_path: Path) -> None:
-    content = JULIET_FILE.replace("CWE89_SQL_Injection", "CWE23_Relative_Path_Traversal")
-    (tmp_path / "CWE23_Relative_Path_Traversal__file_01.java").write_text(content, encoding="utf-8")
+JULIET_CWE23_FILE = """\
+package testcases.CWE23_Relative_Path_Traversal.s01;
+import testcasesupport.*;
+import java.io.*;
+
+public class CWE23_Relative_Path_Traversal__file_01 extends AbstractTestCase {
+    public void bad() throws Throwable {
+        String root = "C:\\\\uploads\\\\";
+        String data = "user.txt";
+        File file = new File(root + data);
+        FileInputStream stream = new FileInputStream(file);
+        stream.close();
+    }
+
+    public void goodG2B() throws Throwable {
+        String root = "C:\\\\uploads\\\\";
+        String data = "safe.txt";
+        File file = new File(root + data);
+        FileInputStream stream = new FileInputStream(file);
+        stream.close();
+    }
+}
+"""
+
+
+def test_juliet_adapter_maps_cwe23_to_cwe22_and_synthesizes(tmp_path: Path) -> None:
+    (tmp_path / "CWE23_Relative_Path_Traversal__file_01.java").write_text(
+        JULIET_CWE23_FILE, encoding="utf-8"
+    )
     pairs = parse_juliet_sources(tmp_path)
     assert len(pairs) == 1
-    assert pairs[0].cwe == "CWE-22"
+    pair = pairs[0]
+    assert pair.cwe == "CWE-22"
+    assert pair.source_id.endswith(":synth")
+    # the G2B constant swap must NOT be the fix; the synthesized guard must be
+    assert "safe.txt" not in pair.fixed_code
+    assert "new File(allowedDir, data)" in pair.fixed_code
+    assert ".normalize()" in pair.fixed_code
+    assert "new File(root + data)" not in pair.fixed_code
+    # vulnerable side keeps the original sink
+    assert "new File(root + data)" in pair.vulnerable_code
+
+
+JULIET_CWE78_FILE = """\
+package testcases.CWE78_OS_Command_Injection.s01;
+import testcasesupport.*;
+import java.io.*;
+
+public class CWE78_OS_Command_Injection__env_01 extends AbstractTestCase {
+    public void bad() throws Throwable {
+        String osCommand = "/bin/ls ";
+        String data = System.getenv("ADD");
+        Process process = Runtime.getRuntime().exec(osCommand + data);
+        process.waitFor();
+    }
+
+    public void goodG2B() throws Throwable {
+        String osCommand = "/bin/ls ";
+        String data = "fixed";
+        Process process = Runtime.getRuntime().exec(osCommand + data);
+        process.waitFor();
+    }
+}
+"""
+
+
+def test_juliet_adapter_synthesizes_cwe78_fix(tmp_path: Path) -> None:
+    (tmp_path / "CWE78_OS_Command_Injection__env_01.java").write_text(
+        JULIET_CWE78_FILE, encoding="utf-8"
+    )
+    pairs = parse_juliet_sources(tmp_path)
+    assert len(pairs) == 1
+    pair = pairs[0]
+    assert pair.cwe == "CWE-78"
+    assert pair.source_id.endswith(":synth")
+    assert ".exec(" not in pair.fixed_code          # vulnerable sink is gone
+    assert "new ProcessBuilder(commandTokens)" in pair.fixed_code
+    assert "data.matches(" in pair.fixed_code        # allow-list validation
+    # the process variable keeps its name so downstream code still compiles
+    assert "Process process = new ProcessBuilder" in pair.fixed_code
+    assert "process.waitFor();" in pair.fixed_code
+    assert ".exec(osCommand + data)" in pair.vulnerable_code
+
+
+def test_synthesize_returns_none_for_unknown_sink() -> None:
+    assert synthesize_fixed_code("CWE-78", "public class X { void bad() {} }") is None
+    assert synthesize_fixed_code("CWE-22", "public class X { void bad() {} }") is None
+    assert synthesize_fixed_code("CWE-89", "anything") is None  # 89 never synthesizes
+
+
+def test_synthesize_cwe22_direct_file_uses_fixed_base() -> None:
+    code = 'public class X {\n    void bad() throws Exception {\n        String data = "x";\n        File file = new File(data);\n    }\n}'
+    fixed = synthesize_fixed_code("CWE-22", code)
+    assert fixed is not None
+    assert 'new File(System.getProperty("user.dir"))' in fixed
+    assert "new File(allowedDir, data)" in fixed
+    assert "new File(data)" not in fixed
 
 
 def test_juliet_adapter_ignores_out_of_scope_cwe(tmp_path: Path) -> None:

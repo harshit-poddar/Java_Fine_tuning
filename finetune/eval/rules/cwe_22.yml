@@ -30,8 +30,10 @@ rules:
     patterns:
       - pattern-either:
           - pattern: new File($BASE, $NAME)
+          - pattern: new File($NAME)
           - pattern: $BASE.resolve($NAME)
       - pattern-not: new File($BASE, "...")
+      - pattern-not: new File("...")
       - pattern-not: $BASE.resolve("...")
       # Suppress when the enclosing method canonicalizes/normalizes the path.
       # The deep-expression operator <... E ...> only parses in an expression

@@ -9,12 +9,15 @@ rules:
     metadata:
       cwe: CWE-78
     patterns:
-      - pattern-either:
-          - pattern: $RT.exec(<... $A + $B ...>)
-          - pattern: Runtime.getRuntime().exec($CMD)
-          - pattern: $RT.exec($CMD)
-      - pattern-not: $RT.exec(new String[]{"...", "..."})
-      - pattern-not: $RT.exec(new String[]{"...", "...", "..."})
+      # any single-argument exec() ($RT also matches Runtime.getRuntime())...
+      - pattern: $RT.exec($CMD)
+      # ...except the tokenized-array form, which does not invoke a shell.
+      # Shell passthrough via an array ("sh","-c",...) is caught by the
+      # java-cmdi-shell-passthrough rule below.
+      - metavariable-pattern:
+          metavariable: $CMD
+          patterns:
+            - pattern-not: new String[]{...}
 
   - id: java-cmdi-shell-passthrough
     languages: [java]

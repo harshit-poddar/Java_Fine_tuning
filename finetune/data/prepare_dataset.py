@@ -221,10 +221,106 @@ _JULIET_GOOD_VARIANTS = (
 _JULIET_GOOD_NAME_RE = re.compile(r"\bgood(?:B2G|G2B)?\d*\b")
 
 
+# ---------------------------------------------------------------------------
+# Sink-fix synthesis (CWE-78, CWE-22)
+# ---------------------------------------------------------------------------
+# Juliet Java ships NO sink-level fix for command injection or path
+# traversal: every good() variant there is G2B - the tainted source is
+# swapped for a constant while the vulnerable sink stays, which is the wrong
+# lesson and is rightly rejected by --semgrep-filter (measured: 444/444
+# CWE-78 and 888/888 CWE-22 pairs are G2B; CWE-89 is 2220/2220 B2G).
+#
+# So for these two CWEs we keep Juliet's bad() methods (rich source/flow
+# variety) and SYNTHESIZE the fixed side by rewriting the one sink line into
+# the secure pattern. Synthesized fixes go through the same javac and semgrep
+# filters as every other pair, so a transform that misfires is dropped, not
+# trained on.
+
+SYNTH_CWES = ("CWE-78", "CWE-22")
+
+_CWE78_EXEC_RE = re.compile(
+    r"^(?P<i>[ \t]*)Process (?P<p>\w+) = Runtime\.getRuntime\(\)\.exec\("
+    r"(?P<cmd>\w+) \+ (?P<data>\w+)\);[ \t]*$",
+    re.MULTILINE,
+)
+
+_CWE22_CONCAT_RE = re.compile(
+    r"^(?P<i>[ \t]*)File (?P<f>\w+) = new File\((?P<root>\w+) \+ (?P<data>\w+)\);[ \t]*$",
+    re.MULTILINE,
+)
+
+_CWE22_DIRECT_RE = re.compile(
+    r"^(?P<i>[ \t]*)File (?P<f>\w+) = new File\((?P<data>data)\);[ \t]*$",
+    re.MULTILINE,
+)
+
+
+def _cwe78_fix(match: re.Match) -> str:
+    """Allow-list the argument, then run it as its own ProcessBuilder token."""
+    i, p, cmd, data = match.group("i", "p", "cmd", "data")
+    return (
+        f'{i}if (!{data}.matches("[A-Za-z0-9._-]+"))\n'
+        f"{i}{{\n"
+        f'{i}    throw new IllegalArgumentException("unsafe command argument: " + {data});\n'
+        f"{i}}}\n"
+        f"{i}java.util.List<String> commandTokens = new java.util.ArrayList<String>("
+        f'java.util.Arrays.asList({cmd}.trim().split("\\\\s+")));\n'
+        f"{i}commandTokens.add({data});\n"
+        f"{i}Process {p} = new ProcessBuilder(commandTokens).start();"
+    )
+
+
+def _cwe22_guard(i: str, f: str, base_expr: str, data: str) -> str:
+    """Resolve against a fixed base dir and reject paths that escape it."""
+    return (
+        f"{i}File allowedDir = new File({base_expr});\n"
+        f"{i}File {f} = new File(allowedDir, {data});\n"
+        f"{i}if (!{f}.toPath().normalize().startsWith(allowedDir.toPath().normalize()))\n"
+        f"{i}{{\n"
+        f'{i}    throw new IllegalArgumentException("path escapes the allowed directory: " + {data});\n'
+        f"{i}}}"
+    )
+
+
+def _cwe22_concat_fix(match: re.Match) -> str:
+    i, f, root, data = match.group("i", "f", "root", "data")
+    return _cwe22_guard(i, f, root, data)
+
+
+def _cwe22_direct_fix(match: re.Match) -> str:
+    i, f, data = match.group("i", "f", "data")
+    return _cwe22_guard(i, f, 'System.getProperty("user.dir")', data)
+
+
+_SINK_SYNTHESIZERS: dict[str, tuple[tuple[re.Pattern, Callable], ...]] = {
+    "CWE-78": ((_CWE78_EXEC_RE, _cwe78_fix),),
+    "CWE-22": ((_CWE22_CONCAT_RE, _cwe22_concat_fix), (_CWE22_DIRECT_RE, _cwe22_direct_fix)),
+}
+
+
+def synthesize_fixed_code(cwe: str, vulnerable_code: str) -> Optional[str]:
+    """Rewrite the first recognized sink in `vulnerable_code` into its secure
+    form. Returns None when no known sink shape matches (caller drops the
+    pair). Any extra unrecognized sinks survive untouched and are caught by
+    the semgrep filter."""
+    for pattern, builder in _SINK_SYNTHESIZERS.get(cwe, ()):
+        fixed, n = pattern.subn(builder, vulnerable_code, count=1)
+        if n:
+            return fixed
+    return None
+
+
 def parse_juliet_sources(raw_dir: Path) -> list[RawPair]:
     """Adapter: NIST Juliet Java testcases. Best-effort method-level extraction;
     pairs whose rewrapped code does not compile are dropped later by the
-    javac filter. Prefers goodB2G fix variants (see _JULIET_GOOD_VARIANTS)."""
+    javac filter.
+
+    The fixed side comes from two places:
+      - CWE-89: Juliet's own good methods (all B2G - real PreparedStatement
+        sink fixes), preferred per _JULIET_GOOD_VARIANTS.
+      - CWE-78 / CWE-22: synthesized from bad() (see synthesize_fixed_code) -
+        Juliet has no sink-level fixes for these, only G2B constant swaps.
+    """
     pairs: list[RawPair] = []
     for java_path in sorted(raw_dir.rglob("*.java")):
         match = _JULIET_FILE_RE.search(java_path.name)
@@ -244,20 +340,32 @@ def parse_juliet_sources(raw_dir: Path) -> list[RawPair]:
             if re.match(r"^\s*import\s+java\.[\w.*]+\s*;\s*$", line)
         ]
         bad = _extract_method(source, "bad")
-        good, variant = None, None
-        for pattern, label in _JULIET_GOOD_VARIANTS:
-            good = _extract_method(source, pattern)
-            if good:
-                variant = label
-                break
-        if not bad or not good:
+        if not bad:
             continue
         stem = re.sub(r"\W", "_", java_path.stem)
+        vulnerable = _wrap_method(bad, imports, f"{stem}_case")
+
+        if cwe in SYNTH_CWES:
+            fixed = synthesize_fixed_code(cwe, vulnerable)
+            variant = "synth"
+            if fixed is None:
+                continue  # no recognized sink shape in bad()
+        else:
+            good, variant = None, None
+            for pattern, label in _JULIET_GOOD_VARIANTS:
+                good = _extract_method(source, pattern)
+                if good:
+                    variant = label
+                    break
+            if not good:
+                continue
+            fixed = _wrap_method(_JULIET_GOOD_NAME_RE.sub("bad", good),
+                                 imports, f"{stem}_case")
+
         pairs.append(
             RawPair(
-                vulnerable_code=_wrap_method(bad, imports, f"{stem}_case"),
-                fixed_code=_wrap_method(_JULIET_GOOD_NAME_RE.sub("bad", good),
-                                        imports, f"{stem}_case"),
+                vulnerable_code=vulnerable,
+                fixed_code=fixed,
                 cwe=cwe,
                 source_id=f"{java_path.relative_to(raw_dir)}:{variant}",
             )
