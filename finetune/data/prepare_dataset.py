@@ -9,6 +9,11 @@ Input adapters (pluggable, auto-detected by default):
   - juliet: NIST Juliet Java layout (CWE89_* / CWE78_* / CWE23|36_* .java test
             files); bad()/goodG2B() methods are extracted best-effort and
             rewrapped — pairs that do not survive the javac filter are dropped.
+  - cvefixes: real-world CVE fix pairs (func_before -> func_after) for Java.
+            Source is either a HuggingFace dataset (set env CVEFIXES_HF=<id>)
+            or local `*cvefixes*.{jsonl,json,parquet}` files in the raw dir.
+            Schema-flexible; every pair still runs the javac + semgrep filters,
+            so noisy real-world rows are dropped, not trained on.
 
 Cleaning: filter to target CWEs, exact dedup, drop pairs whose fixed_code
 fails javac (skipped with a warning when javac is absent), cap length.
@@ -373,9 +378,143 @@ def parse_juliet_sources(raw_dir: Path) -> list[RawPair]:
     return pairs
 
 
+# ---------------------------------------------------------------------------
+# CVEfixes adapter (real-world CVE fix pairs)
+# ---------------------------------------------------------------------------
+# CVEfixes (Bhandari et al.) is method-level before/after code drawn from the
+# commits that fixed real CVEs. There is no single canonical HuggingFace
+# schema, so field names are matched flexibly. Two sources are supported:
+#   1. env CVEFIXES_HF=<dataset_id>  -> loaded via `datasets` (split via
+#      CVEFIXES_SPLIT, default "train").
+#   2. local files matching `*cvefixes*.{jsonl,json,parquet}` in the raw dir.
+# Either way the rows pass through the same javac + semgrep filters as every
+# other pair, so real-world noise (won't-compile, label-disagrees) is dropped.
+
+_CVEFIXES_LANG_FIELDS = ("programming_language", "lang", "language", "file_language")
+_CVEFIXES_BEFORE_FIELDS = ("func_before", "code_before", "before", "vulnerable_code",
+                           "source_before", "before_change", "vul_func")
+_CVEFIXES_AFTER_FIELDS = ("func_after", "code_after", "after", "fixed_code",
+                          "source_after", "after_change", "fix_func")
+_CVEFIXES_CWE_FIELDS = ("cwe_id", "cwe", "cwe_ids", "cwes", "cwe_name")
+_CVEFIXES_ID_FIELDS = ("cve_id", "cve", "commit_id", "hash", "id")
+
+
+def _first_field(row: dict, fields: tuple[str, ...]) -> Optional[object]:
+    for field in fields:
+        value = row.get(field)
+        if value not in (None, ""):
+            return value
+    return None
+
+
+def _cvefixes_is_java(row: dict) -> bool:
+    """True for Java rows (and rows with no language field - CWE+filters decide)."""
+    lang = _first_field(row, _CVEFIXES_LANG_FIELDS)
+    if lang is None:
+        return True
+    text = str(lang).lower()
+    return "java" in text and "javascript" not in text
+
+
+def _cvefixes_cwe(row: dict) -> Optional[str]:
+    """First in-scope target CWE mentioned in the row's CWE field, else None."""
+    raw = _first_field(row, _CVEFIXES_CWE_FIELDS)
+    if raw is None:
+        return None
+    if isinstance(raw, (list, tuple)):
+        text = " ".join(str(x) for x in raw)
+    else:
+        text = str(raw)
+    for num in re.findall(r"\d+", text):
+        canonical = JULIET_CWE_MAP.get(num)
+        if canonical in TARGET_CWES:
+            return canonical
+    return None
+
+
+def _cvefixes_iter_rows(raw_dir: Path) -> Iterable[dict]:
+    """Yield raw record dicts from HF (env CVEFIXES_HF) and/or local files."""
+    hf_id = os.getenv("CVEFIXES_HF", "").strip()
+    if hf_id:
+        try:
+            from datasets import load_dataset  # lazy: optional dependency
+        except ImportError:
+            print("WARNING: CVEFIXES_HF is set but the `datasets` package is not "
+                  "installed - pip install datasets. Skipping HF source.", file=sys.stderr)
+        else:
+            split = os.getenv("CVEFIXES_SPLIT", "train")
+            try:
+                dataset = load_dataset(hf_id, split=split)
+                for row in dataset:
+                    yield dict(row)
+            except Exception as exc:  # network / 404 / bad split - actionable, non-fatal
+                print(f"WARNING: could not load HF dataset {hf_id!r} (split {split!r}): "
+                      f"{exc}. Skipping HF source.", file=sys.stderr)
+
+    for path in sorted(raw_dir.rglob("*cvefixes*")):
+        suffix = path.suffix.lower()
+        try:
+            if suffix == ".jsonl":
+                with path.open(encoding="utf-8") as fh:
+                    for line in fh:
+                        if line.strip():
+                            yield json.loads(line)
+            elif suffix == ".json":
+                data = json.loads(path.read_text(encoding="utf-8"))
+                yield from (data if isinstance(data, list) else [data])
+            elif suffix == ".parquet":
+                try:
+                    import pandas as pd  # lazy: optional dependency
+                except ImportError:
+                    print(f"WARNING: {path.name} needs pandas+pyarrow to read - "
+                          "pip install pandas pyarrow. Skipping file.", file=sys.stderr)
+                    continue
+                for record in pd.read_parquet(path).to_dict(orient="records"):
+                    yield record
+        except Exception as exc:
+            print(f"WARNING: failed to read {path.name}: {exc} - skipping", file=sys.stderr)
+
+
+def parse_cvefixes_sources(raw_dir: Path) -> list[RawPair]:
+    """Adapter: real-world CVE fix pairs for Java, from HF and/or local files.
+
+    Returns [] (no warning) when no CVEfixes source is configured, so `auto`
+    mode stays clean on Juliet-only runs."""
+    pairs: list[RawPair] = []
+    seen_ids = 0
+    for row in _cvefixes_iter_rows(raw_dir):
+        if not _cvefixes_is_java(row):
+            continue
+        cwe = _cvefixes_cwe(row)
+        if cwe is None:
+            continue
+        before = _first_field(row, _CVEFIXES_BEFORE_FIELDS)
+        after = _first_field(row, _CVEFIXES_AFTER_FIELDS)
+        if not before or not after:
+            continue
+        before, after = str(before), str(after)
+        if before.strip() == after.strip():
+            continue  # method-level change was elsewhere; no signal here
+        ident = _first_field(row, _CVEFIXES_ID_FIELDS) or seen_ids
+        seen_ids += 1
+        pairs.append(
+            RawPair(
+                vulnerable_code=before,
+                fixed_code=after,
+                cwe=cwe,
+                source_id=f"cvefixes:{ident}:{seen_ids}",
+            )
+        )
+    if pairs:
+        print(f"cvefixes adapter: {len(pairs)} candidate Java pairs in scope "
+              "(pre-filter)")
+    return pairs
+
+
 PARSERS: dict[str, Callable[[Path], list[RawPair]]] = {
     "csv": parse_csv_sources,
     "juliet": parse_juliet_sources,
+    "cvefixes": parse_cvefixes_sources,
 }
 
 
