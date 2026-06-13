@@ -7,7 +7,7 @@
 # vLLM is also pod-only and comes with the pod image / its own install
 # (see serve/serve_notes.md).
 
-transformers==5.11.0
+transformers>=4.56,<5
 trl==1.5.1
 peft==0.19.1
 datasets==5.0.0
